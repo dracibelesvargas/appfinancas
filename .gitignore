@@ -1,0 +1,13 @@
+# Dados reais (privados) — NUNCA no repositório público do GitHub Pages.
+# O app usa o "histórico manual" (Mais → Histórico dos meses); este arquivo é só do uso local.
+dados/historico-2026.json
+
+# Backups locais do banco (baixados pelo app)
+*.sqlite
+*.sqlite.tmp
+financas-backup-*.sqlite
+
+# Lixo de sistema/editor
+.DS_Store
+Thumbs.db
+*.log
