@@ -2671,6 +2671,214 @@ function formTransacao(tipo) {
   ]);
 }
 
+/* ---------------- lançamento rápido / colar lista (provisórios) ---------------- */
+
+/** Categoria já usada antes para essa descrição/tipo — para não deixar tudo "a classificar". */
+const catAprendidaApp = (desc, tipo) =>
+  desc
+    ? bd.valor(
+        `SELECT categoria_id FROM transacoes WHERE excluido_em IS NULL AND categoria_id IS NOT NULL AND revisar = 0
+           AND UPPER(descricao) = UPPER(?) AND tipo = ? ORDER BY atualizado_em DESC LIMIT 1`,
+        [desc, tipo]
+      )
+    : null;
+
+const catSistema = (tipo) =>
+  bd.valor("SELECT id FROM categorias WHERE do_sistema = 1 AND tipo = ? AND excluido_em IS NULL",
+    [tipo === "receita" ? "receita" : "despesa"]);
+
+/** Insere um lançamento provisório (origem manual, provisorio=1). Devolve a competência. */
+function inserirProvisorio({ tipo, valor, descricao, data, contaId, cartaoId, meio }) {
+  const { mes, ano } = competencia(data);
+  const aprend = catAprendidaApp(descricao, tipo);
+  const cat = aprend ?? catSistema(tipo);
+  const id = bd.uuid();
+  const t = bd.agora();
+  bd.executar(
+    `INSERT INTO transacoes (id, tipo, valor, descricao, data, mes, ano, conta_id, cartao_id,
+                             categoria_id, meio_pagamento, provisorio, origem, situacao, revisar,
+                             criado_em, atualizado_em, dispositivo)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,1,'manual','efetivada',?,?,?,?)`,
+    [id, tipo, valor, descricao || null, data, mes, ano,
+     tipo === "despesa_cartao" ? null : contaId,
+     tipo === "despesa_cartao" ? cartaoId : null,
+     cat, tipo === "despesa_cartao" ? "credito" : meio || "pix", aprend ? 0 : 1, t, t, bd.idDispositivo()]
+  );
+  bd.enfileirar("transacoes", id, "insert");
+  return { mes, ano };
+}
+
+/** Lançamento rápido: para quando chega a notificação de um gasto. Já entra provisório. */
+function formRapido() {
+  const contas = bd.todos("SELECT id, nome FROM contas WHERE excluido_em IS NULL AND arquivada = 0 ORDER BY nome");
+  const cartoes = bd.todos("SELECT id, nome FROM cartoes WHERE excluido_em IS NULL AND arquivado = 0 ORDER BY nome");
+  if (!contas.length && !cartoes.length) {
+    return abrirFolha("Lançamento rápido", vazio(ICONES.carteira, "Sem conta nem cartão",
+      "Cadastre uma conta ou um cartão para lançar."));
+  }
+
+  const valorIn = el("input", { inputmode: "decimal", placeholder: "0,00" });
+  const desc = el("input", { placeholder: "opcional (ex.: Padaria)" });
+  const data = el("input", { type: "date", value: iso(hoje) });
+  const conta = selectDe(contas);
+  const cartao = selectDe(cartoes);
+  const campoConta = campo("Conta", conta);
+  const campoCartao = campo("Cartão", cartao);
+  const erro = el("p", { class: "erro" });
+
+  const modos = [];
+  if (contas.length) modos.push(["despesa", "Saída"], ["receita", "Entrada"]);
+  if (cartoes.length) modos.push(["despesa_cartao", "Cartão"]);
+  let modo = modos[0][0];
+  const seg = el("div", { class: "abas-mini" });
+  const btns = modos.map(([m, lbl]) => {
+    const bx = el("button", { class: "aba-mini", type: "button", text: lbl });
+    bx.onclick = () => { modo = m; pintar(); };
+    seg.append(bx);
+    return { m, bx };
+  });
+  const pintar = () => {
+    btns.forEach((b) => b.bx.classList.toggle("sel", b.m === modo));
+    campoConta.style.display = modo === "despesa_cartao" ? "none" : "";
+    campoCartao.style.display = modo === "despesa_cartao" ? "" : "none";
+  };
+
+  const salvar = el("button", { class: "btn largo", type: "button", text: "Salvar (provisório)" });
+  salvar.onclick = () => {
+    erro.textContent = "";
+    const v = paraCentavos(valorIn.value);
+    if (!v || v <= 0) return (erro.textContent = "Informe um valor maior que zero.");
+    if (!data.value) return (erro.textContent = "Informe a data.");
+    const { mes, ano } = inserirProvisorio({
+      tipo: modo, valor: v, descricao: desc.value.trim(), data: data.value,
+      contaId: conta.value, cartaoId: cartao.value,
+    });
+    $("#folha").close();
+    estado.mes = mes;
+    estado.ano = ano;
+    render();
+  };
+
+  pintar();
+  abrirFolha("Lançamento rápido", [
+    el("p", { class: "dica", style: "margin-top:0", text:
+      "Para quando chega a notificação. Entra como provisório e concilia sozinho na importação da fatura/extrato." }),
+    el("div", { class: "campo valor-grande" }, [el("label", { text: "Valor" }), valorIn]),
+    campo("Tipo", seg),
+    campoConta,
+    campoCartao,
+    campo("Data", data),
+    campo("Descrição", desc),
+    erro,
+    salvar,
+  ]);
+}
+
+/** Extrai transações de um texto colado (a lista do print, via "copiar texto da imagem"). */
+function parseLista(texto) {
+  const itens = [];
+  for (const bruto of (texto || "").split(/\n/)) {
+    const linha = bruto.trim();
+    if (!linha) continue;
+    // Pega o ÚLTIMO valor monetário da linha (o total costuma fechar a linha).
+    const toks = [...linha.matchAll(/(-|−|\+)?\s*R?\$?\s*((?:\d{1,3}(?:\.\d{3})*|\d+),\d{2})/g)];
+    if (!toks.length) continue;
+    const ult = toks[toks.length - 1];
+    const v = paraCentavos(ult[2]);
+    if (v == null || v === 0) continue;
+    let descricao = linha.slice(0, ult.index).trim();
+    if (!descricao) descricao = linha.replace(ult[0], "").trim();
+    descricao = descricao.replace(/[-−+·|]\s*$/, "").trim();
+    const low = linha.toLowerCase();
+    const entrada = ult[1] === "+" || /recebid|cr[ée]dit|entrada|estorno|reembols|devolu|deposit/.test(low);
+    itens.push({ descricao: descricao || "—", valor: Math.abs(v), tipo: entrada ? "receita" : "despesa" });
+  }
+  return itens;
+}
+
+/** Revisar os itens extraídos e salvar como provisórios. */
+function revisarLista(itens, destinoValue) {
+  const [esp, id] = destinoValue.split(":");
+  const contaId = esp === "c" ? id : null;
+  const cartaoId = esp === "k" ? id : null;
+  const data = el("input", { type: "date", value: iso(hoje) });
+  const estados = itens.map((it) => ({ ...it, incluir: true }));
+
+  const bloco = el("div", { class: "bloco" });
+  for (const st of estados) {
+    const cb = el("input", { type: "checkbox" });
+    cb.checked = true;
+    cb.onchange = () => { st.incluir = cb.checked; };
+    const linha = el("label", { class: "item", style: "cursor:pointer" });
+    linha.append(cb, el("div", { class: "item-corpo" }, [el("div", { class: "item-nome", text: st.descricao })]));
+    if (!cartaoId) {
+      const tipoSel = selectDe([{ valor: "despesa", rotulo: "Saída" }, { valor: "receita", rotulo: "Entrada" }], st.tipo);
+      tipoSel.style.width = "96px";
+      tipoSel.onchange = () => { st.tipo = tipoSel.value; };
+      linha.append(tipoSel);
+    }
+    linha.append(el("span", { class: "item-valor", text: $$(st.valor) }));
+    bloco.append(linha);
+  }
+
+  const salvar = el("button", { class: "btn largo", type: "button", text: "Salvar provisórios" });
+  salvar.onclick = () => {
+    let ultimo = null;
+    let n = 0;
+    for (const st of estados) {
+      if (!st.incluir) continue;
+      ultimo = inserirProvisorio({
+        tipo: cartaoId ? "despesa_cartao" : st.tipo, valor: st.valor, descricao: st.descricao,
+        data: data.value, contaId, cartaoId,
+      });
+      n++;
+    }
+    $("#folha").close();
+    if (ultimo) { estado.mes = ultimo.mes; estado.ano = ultimo.ano; }
+    render();
+  };
+
+  abrirFolha("Revisar lançamentos", [
+    el("p", { class: "dica", style: "margin-top:0", text:
+      `${estados.length} encontrados. Desmarque os errados${cartaoId ? "" : " e ajuste Saída/Entrada"}. Todos entram como provisórios na data abaixo.` }),
+    campo("Data", data),
+    bloco,
+    salvar,
+  ]);
+}
+
+/** Colar a lista do print (texto extraído pelo celular) e virar vários provisórios. */
+function formColarLista() {
+  const contas = bd.todos("SELECT id, nome FROM contas WHERE excluido_em IS NULL AND arquivada = 0 ORDER BY nome");
+  const cartoes = bd.todos("SELECT id, nome FROM cartoes WHERE excluido_em IS NULL AND arquivado = 0 ORDER BY nome");
+  if (!contas.length && !cartoes.length) {
+    return abrirFolha("Colar lista", vazio(ICONES.carteira, "Sem conta nem cartão", "Cadastre uma conta ou cartão primeiro."));
+  }
+  const area = el("textarea", { rows: "8", placeholder: "Cole aqui a lista (uma transação por linha)…",
+    style: "width:100%;box-sizing:border-box;resize:vertical;min-height:120px" });
+  const destino = selectDe([
+    ...contas.map((c) => ({ id: `c:${c.id}`, nome: c.nome })),
+    ...cartoes.map((c) => ({ id: `k:${c.id}`, nome: `${c.nome} (cartão)` })),
+  ]);
+  const erro = el("p", { class: "erro" });
+  const analisar = el("button", { class: "btn largo", type: "button", text: "Analisar" });
+  analisar.onclick = () => {
+    erro.textContent = "";
+    const itens = parseLista(area.value);
+    if (!itens.length) return (erro.textContent = "Não achei valores. Deixe uma transação por linha, com o valor (ex.: 71,74).");
+    revisarLista(itens, destino.value);
+  };
+
+  abrirFolha("Colar lista do dia", [
+    el("p", { class: "dica", style: "margin-top:0", text:
+      "No print do banco, use o \"copiar texto da imagem\" do celular (Google Lens / Live Text) e cole aqui. Cada linha vira um provisório." }),
+    campo("Onde caiu", destino),
+    campo("Transações (uma por linha)", area),
+    erro,
+    analisar,
+  ]);
+}
+
 function seletorMes(anoView) {
   // Chamado do clique (recebe o evento) ou da navegação de ano (recebe o número).
   if (typeof anoView !== "number") anoView = estado.ano;
@@ -2717,6 +2925,18 @@ function abrirImportacao() {
     b.onclick = () => escolherArquivo(especie);
     escolha.append(b);
   }
+
+  // Colar a lista do print (via "copiar texto da imagem" do celular) → provisórios.
+  const bColar = el("button", { class: "item", type: "button" });
+  bColar.append(
+    el("span", { class: "item-icone" }, svg(ICONES.lista)),
+    el("div", { class: "item-corpo" }, [
+      el("div", { class: "item-nome", text: "Colar lista de transações" }),
+      el("div", { class: "item-sub", text: "do print do dia — vira provisórios que conciliam depois" }),
+    ])
+  );
+  bColar.onclick = () => formColarLista();
+  escolha.append(bColar);
 
   abrirFolha("Importar", [
     el("p", { class: "dica", style: "margin:0 0 12px", text:
@@ -3035,7 +3255,8 @@ function ligar() {
   leque.querySelectorAll(".leque-op").forEach((op) => {
     op.onclick = () => {
       fechar();
-      if (op.dataset.tipo === "investimento") formInvestir();
+      if (op.dataset.tipo === "rapido") formRapido();
+      else if (op.dataset.tipo === "investimento") formInvestir();
       else formTransacao(op.dataset.tipo);
     };
   });
