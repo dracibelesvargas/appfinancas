@@ -2687,9 +2687,11 @@ const catSistema = (tipo) =>
   bd.valor("SELECT id FROM categorias WHERE do_sistema = 1 AND tipo = ? AND excluido_em IS NULL",
     [tipo === "receita" ? "receita" : "despesa"]);
 
-/** Insere um lançamento provisório (origem manual, provisorio=1). Devolve a competência. */
-function inserirProvisorio({ tipo, valor, descricao, data, contaId, cartaoId, meio }) {
-  const { mes, ano } = competencia(data);
+/** Insere um lançamento provisório (origem manual, provisorio=1). Devolve a competência.
+ *  mesForcado/anoForcado sobrepõem a competência (usado no cartão: vai na fatura escolhida,
+ *  não na competência da data da compra). */
+function inserirProvisorio({ tipo, valor, descricao, data, contaId, cartaoId, meio, mesForcado, anoForcado }) {
+  const { mes, ano } = mesForcado && anoForcado ? { mes: mesForcado, ano: anoForcado } : competencia(data);
   const aprend = catAprendidaApp(descricao, tipo);
   const cat = aprend ?? catSistema(tipo);
   const id = bd.uuid();
@@ -2726,6 +2728,17 @@ function formRapido() {
   const campoCartao = campo("Cartão", cartao);
   const erro = el("p", { class: "erro" });
 
+  // Fatura (mês de cobrança) — só para cartão. Padrão: mês seguinte.
+  const h = competencia(hoje);
+  let fm = h.mes + 1, fy = h.ano;
+  if (fm > 12) { fm = 1; fy += 1; }
+  const fatMes = selectDe(MESES.map((m, i) => ({ valor: String(i + 1), rotulo: m })), String(fm));
+  const fatAno = selectDe([fy - 1, fy, fy + 1].map((y) => ({ valor: String(y), rotulo: String(y) })), String(fy));
+  const campoFatura = el("div", { class: "campo" }, [
+    el("label", { text: "Fatura (mês de cobrança)" }),
+    el("div", { style: "display:flex;gap:8px" }, [fatMes, fatAno]),
+  ]);
+
   const modos = [];
   if (contas.length) modos.push(["despesa", "Saída"], ["receita", "Entrada"]);
   if (cartoes.length) modos.push(["despesa_cartao", "Cartão"]);
@@ -2738,9 +2751,11 @@ function formRapido() {
     return { m, bx };
   });
   const pintar = () => {
+    const cartaoModo = modo === "despesa_cartao";
     btns.forEach((b) => b.bx.classList.toggle("sel", b.m === modo));
-    campoConta.style.display = modo === "despesa_cartao" ? "none" : "";
-    campoCartao.style.display = modo === "despesa_cartao" ? "" : "none";
+    campoConta.style.display = cartaoModo ? "none" : "";
+    campoCartao.style.display = cartaoModo ? "" : "none";
+    campoFatura.style.display = cartaoModo ? "" : "none";
   };
 
   const salvar = el("button", { class: "btn largo", type: "button", text: "Salvar (provisório)" });
@@ -2749,9 +2764,12 @@ function formRapido() {
     const v = paraCentavos(valorIn.value);
     if (!v || v <= 0) return (erro.textContent = "Informe um valor maior que zero.");
     if (!data.value) return (erro.textContent = "Informe a data.");
+    const cartaoModo = modo === "despesa_cartao";
     const { mes, ano } = inserirProvisorio({
       tipo: modo, valor: v, descricao: desc.value.trim(), data: data.value,
       contaId: conta.value, cartaoId: cartao.value,
+      mesForcado: cartaoModo ? Number(fatMes.value) : null,
+      anoForcado: cartaoModo ? Number(fatAno.value) : null,
     });
     $("#folha").close();
     estado.mes = mes;
@@ -2767,6 +2785,7 @@ function formRapido() {
     campo("Tipo", seg),
     campoConta,
     campoCartao,
+    campoFatura,
     campo("Data", data),
     campo("Descrição", desc),
     erro,
@@ -2774,24 +2793,59 @@ function formRapido() {
   ]);
 }
 
-/** Extrai transações de um texto colado (a lista do print, via "copiar texto da imagem"). */
+/**
+ * Extrai transações de um texto colado (a lista do print). Entende dois formatos:
+ *  - uma transação por linha: "Uber   -R$ 23,50"
+ *  - em BLOCO (o do cartão): data numa linha, loja noutra, "Cartão final 1014", "R$ 215,47".
+ * O valor fecha cada transação; a data e a descrição vêm das linhas anteriores do bloco.
+ */
 function parseLista(texto) {
+  const reValor = /(-|−|\+)?\s*R?\$?\s*((?:\d{1,3}(?:\.\d{3})*|\d+),\d{2})/;
+  const reData = /(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?/;
+  const reSoData = new RegExp(`^${reData.source}$`);
+  const reCartao = /cart[aã]o\s*final\s*(\d{3,4})/i;
+  const anoAtual = hoje.getFullYear();
+  const normData = (m) => {
+    const dd = String(m[1]).padStart(2, "0");
+    const mm = String(m[2]).padStart(2, "0");
+    let yy = m[3] ? String(m[3]) : String(anoAtual);
+    if (yy.length === 2) yy = "20" + yy;
+    return `${yy}-${mm}-${dd}`;
+  };
+
   const itens = [];
+  let dataPend = null;
+  let descPend = [];
+  let cartaoPend = null;
+  const reset = () => { dataPend = null; descPend = []; cartaoPend = null; };
+
   for (const bruto of (texto || "").split(/\n/)) {
-    const linha = bruto.trim();
-    if (!linha) continue;
-    // Pega o ÚLTIMO valor monetário da linha (o total costuma fechar a linha).
-    const toks = [...linha.matchAll(/(-|−|\+)?\s*R?\$?\s*((?:\d{1,3}(?:\.\d{3})*|\d+),\d{2})/g)];
-    if (!toks.length) continue;
-    const ult = toks[toks.length - 1];
-    const v = paraCentavos(ult[2]);
-    if (v == null || v === 0) continue;
-    let descricao = linha.slice(0, ult.index).trim();
-    if (!descricao) descricao = linha.replace(ult[0], "").trim();
-    descricao = descricao.replace(/[-−+·|]\s*$/, "").trim();
-    const low = linha.toLowerCase();
-    const entrada = ult[1] === "+" || /recebid|cr[ée]dit|entrada|estorno|reembols|devolu|deposit/.test(low);
-    itens.push({ descricao: descricao || "—", valor: Math.abs(v), tipo: entrada ? "receita" : "despesa" });
+    const l = bruto.trim();
+    if (!l) continue;
+
+    const soData = l.match(reSoData);
+    if (soData) { dataPend = normData(soData); continue; }
+
+    const mc = l.match(reCartao);
+    if (mc && l.replace(reCartao, "").trim() === "") { cartaoPend = mc[1]; continue; }
+
+    const mv = l.match(reValor);
+    if (mv) {
+      const antes = l.slice(0, mv.index).replace(reCartao, "").trim();
+      if (antes) descPend.push(antes);
+      const v = paraCentavos(mv[2]);
+      if (v != null && v !== 0) {
+        const descricao = descPend.join(" ").replace(/\s+/g, " ").trim() || "—";
+        const low = (descricao + " " + l).toLowerCase();
+        const entrada = mv[1] === "+" || /recebid|cr[ée]dit|entrada|estorno|reembols|devolu|deposit/.test(low);
+        itens.push({ data: dataPend, descricao, valor: Math.abs(v), tipo: entrada ? "receita" : "despesa", cartaoFinal: cartaoPend });
+      }
+      reset();
+      continue;
+    }
+
+    // Linha de texto comum: parte da descrição.
+    descPend.push(l);
   }
   return itens;
 }
@@ -2801,8 +2855,21 @@ function revisarLista(itens, destinoValue) {
   const [esp, id] = destinoValue.split(":");
   const contaId = esp === "c" ? id : null;
   const cartaoId = esp === "k" ? id : null;
-  const data = el("input", { type: "date", value: iso(hoje) });
+  const dataFallback = el("input", { type: "date", value: iso(hoje) }); // para itens sem data no texto
   const estados = itens.map((it) => ({ ...it, incluir: true }));
+
+  // Cartão: os lançamentos vão para a FATURA de um mês (não na competência da data da
+  // compra). Padrão: o mês seguinte ao atual.
+  const h = competencia(hoje);
+  let fm = h.mes + 1, fy = h.ano;
+  if (fm > 12) { fm = 1; fy += 1; }
+  const fatMes = selectDe(MESES.map((m, i) => ({ valor: String(i + 1), rotulo: m })), String(fm));
+  const fatAno = selectDe([fy - 1, fy, fy + 1].map((y) => ({ valor: String(y), rotulo: String(y) })), String(fy));
+  const campoFatura = el("div", { class: "campo" }, [
+    el("label", { text: "Fatura (mês de cobrança)" }),
+    el("div", { style: "display:flex;gap:8px" }, [fatMes, fatAno]),
+    el("p", { class: "dica", text: "Compras de cartão entram na fatura em que serão pagas." }),
+  ]);
 
   const bloco = el("div", { class: "bloco" });
   for (const st of estados) {
@@ -2810,28 +2877,31 @@ function revisarLista(itens, destinoValue) {
     cb.checked = true;
     cb.onchange = () => { st.incluir = cb.checked; };
     const linha = el("label", { class: "item", style: "cursor:pointer" });
-    linha.append(cb, el("div", { class: "item-corpo" }, [el("div", { class: "item-nome", text: st.descricao })]));
+    linha.append(cb, el("div", { class: "item-corpo" }, [
+      el("div", { class: "item-nome", text: st.descricao }),
+      el("div", { class: "item-sub", text: st.data ? dataBR(st.data) : "sem data" }),
+    ]));
     if (!cartaoId) {
       const tipoSel = selectDe([{ valor: "despesa", rotulo: "Saída" }, { valor: "receita", rotulo: "Entrada" }], st.tipo);
       tipoSel.style.width = "96px";
       tipoSel.onchange = () => { st.tipo = tipoSel.value; };
       linha.append(tipoSel);
     }
-    linha.append(el("span", { class: "item-valor", text: $$(st.valor) }));
+    linha.append(el("span", { class: "item-valor" + (cartaoId || st.tipo === "despesa" ? " down" : " up"), text: $$(st.valor) }));
     bloco.append(linha);
   }
 
   const salvar = el("button", { class: "btn largo", type: "button", text: "Salvar provisórios" });
   salvar.onclick = () => {
     let ultimo = null;
-    let n = 0;
     for (const st of estados) {
       if (!st.incluir) continue;
+      const data = st.data || dataFallback.value;
       ultimo = inserirProvisorio({
-        tipo: cartaoId ? "despesa_cartao" : st.tipo, valor: st.valor, descricao: st.descricao,
-        data: data.value, contaId, cartaoId,
+        tipo: cartaoId ? "despesa_cartao" : st.tipo, valor: st.valor, descricao: st.descricao, data, contaId, cartaoId,
+        mesForcado: cartaoId ? Number(fatMes.value) : null,
+        anoForcado: cartaoId ? Number(fatAno.value) : null,
       });
-      n++;
     }
     $("#folha").close();
     if (ultimo) { estado.mes = ultimo.mes; estado.ano = ultimo.ano; }
@@ -2840,8 +2910,8 @@ function revisarLista(itens, destinoValue) {
 
   abrirFolha("Revisar lançamentos", [
     el("p", { class: "dica", style: "margin-top:0", text:
-      `${estados.length} encontrados. Desmarque os errados${cartaoId ? "" : " e ajuste Saída/Entrada"}. Todos entram como provisórios na data abaixo.` }),
-    campo("Data", data),
+      `${estados.length} encontrados. Desmarque os errados${cartaoId ? "" : " e ajuste Saída/Entrada"}. Entram como provisórios.` }),
+    cartaoId ? campoFatura : campo("Data (para itens sem data)", dataFallback),
     bloco,
     salvar,
   ]);
