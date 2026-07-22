@@ -13,6 +13,7 @@
  */
 
 import * as bd from "./banco.js";
+import { chaveMerchant } from "./dominio.js";
 import { lerFatura } from "./importar-fatura.js";
 import { lerExtrato } from "./importar-extrato.js";
 
@@ -29,18 +30,27 @@ const catSemCategoria = (tipo) =>
     [tipo === "receita" ? "receita" : "despesa"]
   )?.id ?? null;
 
-/** Uma descrição já classificada antes ensina a próxima importação. */
-function categoriaAprendida(descricao, tipo) {
-  if (!descricao) return null;
-  const achado = bd.um(
-    `SELECT categoria_id FROM transacoes
-     WHERE excluido_em IS NULL AND categoria_id IS NOT NULL AND revisar = 0
-       AND UPPER(descricao) = UPPER(?) AND tipo = ?
-     ORDER BY atualizado_em DESC LIMIT 1`,
-    [descricao, tipo]
-  );
-  return achado?.categoria_id ?? null;
+const tipoBase = (tipo) => (tipo === "receita" ? "receita" : "despesa");
+
+/**
+ * Monta o mapa de aprendizado por comerciante a partir de tudo que já foi classificado:
+ * chave "despesa|FACEBK" -> categoria. Cartão e conta compartilham o aprendizado (ambos
+ * são "despesa"), então classificar a Amazon uma vez vale para os dois.
+ */
+function mapaAprendizado() {
+  const mapa = {};
+  for (const r of bd.todos(
+    `SELECT descricao, tipo, categoria_id FROM transacoes
+     WHERE excluido_em IS NULL AND categoria_id IS NOT NULL AND revisar = 0 AND descricao IS NOT NULL
+     ORDER BY atualizado_em ASC`
+  )) {
+    const k = chaveMerchant(r.descricao);
+    if (k) mapa[`${tipoBase(r.tipo)}|${k}`] = r.categoria_id; // ordem ASC: o mais recente vence
+  }
+  return mapa;
 }
+
+const aprendida = (mapa, descricao, tipo) => mapa[`${tipoBase(tipo)}|${chaveMerchant(descricao)}`] ?? null;
 
 /**
  * Procura um lançamento PROVISÓRIO (lançado à mão a partir de uma notificação) que case com
@@ -86,6 +96,7 @@ export function gravarFatura(analise, { cartaoId, arquivo }) {
     const t = bd.agora();
     const disp = bd.idDispositivo();
     const semCat = catSemCategoria("despesa");
+    const mapa = mapaAprendizado();
 
     for (const i of analise.itens) {
       // Compra parcelada: identidade estável da compra entre faturas (mesma descrição,
@@ -107,7 +118,7 @@ export function gravarFatura(analise, { cartaoId, arquivo }) {
         duplicados++;
         continue;
       }
-      const cat = categoriaAprendida(i.descricao, "despesa") ?? semCat;
+      const cat = aprendida(mapa, i.descricao, "despesa") ?? semCat;
       const precisaRevisar = cat === semCat ? 1 : 0;
 
       // Um lançamento PROVISÓRIO da pessoa (notificação) que case: confirma-o em vez de
@@ -226,6 +237,7 @@ export function gravarExtrato(analise, { contaId, cartaoId, arquivo }) {
 
     // OFX traz o titular só quando já foi aprendido; se veio, guarda para as próximas.
     if (analise.cabecalho?.titular) bd.definirConfig("titular_nome", analise.cabecalho.titular);
+    const mapa = mapaAprendizado();
 
     // Dedup cross-formato (PDF x OFX): a impressão difere entre os formatos, mas o mesmo
     // lançamento tem a mesma chave natural (conta + data + valor). Conta quantos já existem
@@ -266,7 +278,7 @@ export function gravarExtrato(analise, { contaId, cartaoId, arquivo }) {
       }
 
       const ehTransf = i.tipo === "transferencia";
-      const cat = ehTransf ? null : categoriaAprendida(i.descricao, i.tipo) ?? catSemCategoria(i.tipo);
+      const cat = ehTransf ? null : aprendida(mapa, i.descricao, i.tipo) ?? catSemCategoria(i.tipo);
       // Já classificado pelo histórico não precisa entrar na fila.
       const precisaRevisar = ehTransf ? i.revisar : cat === catSemCategoria(i.tipo) ? 1 : 0;
 

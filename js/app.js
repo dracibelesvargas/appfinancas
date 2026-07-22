@@ -5,7 +5,7 @@ import * as imp from "./importar.js";
 import * as hist from "./migrar-historico.js";
 import * as nuvem from "./nuvem.js";
 import {
-  MESES, MESES_LONGO, aplicadoInvestimento, brl, competencia, dataBR, dataVencimento, despesasDoMes,
+  MESES, MESES_LONGO, aplicadoInvestimento, brl, chaveMerchant, competencia, dataBR, dataVencimento, despesasDoMes,
   despesasExibicao, faturaDoMes, fixasDoMes, historicoDoMes, iso, limiteDisponivel, mesEhProjetado,
   paraCentavos, previstoDoMes, receitasDoMes, receitasExibicao, saldoConta, saldoContaNoMes,
   saldoDisponivel, saldoExibicao, saldoNoMes, saldoTotal, totalFixas, totalInvestido, totalReservado,
@@ -472,6 +472,19 @@ function telaTransacoes(c) {
       vazio(ICONES.lista, "Ops, você não possui transações registradas",
             "Adicione suas transações para o mês atual usando o botão (+).")));
     return;
+  }
+
+  // Auto-classificar pelo aprendizado: aparece quando há itens "a classificar" no mês.
+  const nPend = linhas.filter((t) => t.revisar).length;
+  if (nPend) {
+    const bAuto = el("button", { class: "btn fantasma largo", type: "button",
+      text: `Auto-classificar pelo aprendizado (${nPend} a classificar)`, style: "margin-bottom:14px" });
+    bAuto.onclick = () => {
+      const n = autoClassificar();
+      render();
+      if (!n) alert("Nada foi classificado ainda. Classifique um lançamento de cada comerciante e depois toque aqui: o app reconhece os demais pela loja.");
+    };
+    c.append(bAuto);
   }
 
   const bloco = el("div", { class: "bloco" });
@@ -2673,15 +2686,38 @@ function formTransacao(tipo) {
 
 /* ---------------- lançamento rápido / colar lista (provisórios) ---------------- */
 
-/** Categoria já usada antes para essa descrição/tipo — para não deixar tudo "a classificar". */
-const catAprendidaApp = (desc, tipo) =>
-  desc
-    ? bd.valor(
-        `SELECT categoria_id FROM transacoes WHERE excluido_em IS NULL AND categoria_id IS NOT NULL AND revisar = 0
-           AND UPPER(descricao) = UPPER(?) AND tipo = ? ORDER BY atualizado_em DESC LIMIT 1`,
-        [desc, tipo]
-      )
-    : null;
+/** Categoria já usada para o mesmo COMERCIANTE — aprende por loja, não por texto exato. */
+const catAprendidaApp = (desc, tipo) => {
+  const chave = chaveMerchant(desc);
+  if (!chave) return null;
+  const base = tipo === "receita" ? "receita" : "despesa";
+  const linhas = bd.todos(
+    `SELECT descricao, categoria_id FROM transacoes
+     WHERE excluido_em IS NULL AND categoria_id IS NOT NULL AND revisar = 0 AND descricao IS NOT NULL
+       AND (CASE WHEN tipo='receita' THEN 'receita' ELSE 'despesa' END) = ?
+     ORDER BY atualizado_em DESC`,
+    [base]
+  );
+  for (const r of linhas) if (chaveMerchant(r.descricao) === chave) return r.categoria_id;
+  return null;
+};
+
+/** Classifica automaticamente os pendentes que casam com um comerciante já aprendido. */
+function autoClassificar() {
+  const pend = bd.todos(
+    "SELECT id, descricao, tipo FROM transacoes WHERE excluido_em IS NULL AND revisar = 1 AND descricao IS NOT NULL"
+  );
+  let n = 0;
+  for (const p of pend) {
+    const cat = catAprendidaApp(p.descricao, p.tipo);
+    if (cat) {
+      bd.executar("UPDATE transacoes SET categoria_id=?, revisar=0, atualizado_em=? WHERE id=?", [cat, bd.agora(), p.id]);
+      bd.enfileirar("transacoes", p.id, "update");
+      n++;
+    }
+  }
+  return n;
+}
 
 const catSistema = (tipo) =>
   bd.valor("SELECT id FROM categorias WHERE do_sistema = 1 AND tipo = ? AND excluido_em IS NULL",
@@ -2850,16 +2886,30 @@ function parseLista(texto) {
   return itens;
 }
 
-/** Revisar os itens extraídos e salvar como provisórios. */
-function revisarLista(itens, destinoValue) {
-  const [esp, id] = destinoValue.split(":");
-  const contaId = esp === "c" ? id : null;
-  const cartaoId = esp === "k" ? id : null;
-  const dataFallback = el("input", { type: "date", value: iso(hoje) }); // para itens sem data no texto
-  const estados = itens.map((it) => ({ ...it, incluir: true }));
+/** Revisar os itens extraídos e salvar como provisórios. O destino (conta/cartão) é
+ *  escolhido aqui: se o texto tinha "Cartão final", já sugere o cartão e mostra a fatura. */
+function revisarLista(itens) {
+  const contas = bd.todos("SELECT id, nome FROM contas WHERE excluido_em IS NULL AND arquivada = 0 ORDER BY nome");
+  const cartoes = bd.todos("SELECT id, nome FROM cartoes WHERE excluido_em IS NULL AND arquivado = 0 ORDER BY nome");
+  const opts = [
+    ...contas.map((c) => ({ id: `c:${c.id}`, nome: c.nome })),
+    ...cartoes.map((c) => ({ id: `k:${c.id}`, nome: `${c.nome} (cartão)` })),
+  ];
+  // Detecção: se o print tinha "Cartão final XXXX", o destino padrão é um cartão (o que casa
+  // o final, se der; senão o primeiro) — é o que faltava para aparecer a fatura.
+  const finalDetectado = itens.find((it) => it.cartaoFinal)?.cartaoFinal;
+  let destinoPadrao = opts[0]?.id;
+  if (finalDetectado && cartoes.length) {
+    const casa = cartoes.find((c) => (c.nome || "").replace(/\D/g, "").includes(finalDetectado));
+    destinoPadrao = `k:${(casa || cartoes[0]).id}`;
+  }
+  const destino = selectDe(opts, destinoPadrao);
 
-  // Cartão: os lançamentos vão para a FATURA de um mês (não na competência da data da
-  // compra). Padrão: o mês seguinte ao atual.
+  const dataFallback = el("input", { type: "date", value: iso(hoje) });
+  const faltamData = itens.some((it) => !it.data);
+  const campoData = campo("Data (itens sem data)", dataFallback);
+
+  // Fatura (mês de cobrança) — só para cartão. Padrão: mês seguinte.
   const h = competencia(hoje);
   let fm = h.mes + 1, fy = h.ano;
   if (fm > 12) { fm = 1; fy += 1; }
@@ -2871,34 +2921,44 @@ function revisarLista(itens, destinoValue) {
     el("p", { class: "dica", text: "Compras de cartão entram na fatura em que serão pagas." }),
   ]);
 
+  const estados = itens.map((it) => ({ ...it, incluir: true, tipoSel: null }));
   const bloco = el("div", { class: "bloco" });
   for (const st of estados) {
     const cb = el("input", { type: "checkbox" });
     cb.checked = true;
     cb.onchange = () => { st.incluir = cb.checked; };
-    const linha = el("label", { class: "item", style: "cursor:pointer" });
-    linha.append(cb, el("div", { class: "item-corpo" }, [
-      el("div", { class: "item-nome", text: st.descricao }),
-      el("div", { class: "item-sub", text: st.data ? dataBR(st.data) : "sem data" }),
+    st.tipoSel = selectDe([{ valor: "despesa", rotulo: "Saída" }, { valor: "receita", rotulo: "Entrada" }], st.tipo);
+    st.tipoSel.style.width = "96px";
+    st.tipoSel.onchange = () => { st.tipo = st.tipoSel.value; };
+    bloco.append(el("label", { class: "item", style: "cursor:pointer" }, [
+      cb,
+      el("div", { class: "item-corpo" }, [
+        el("div", { class: "item-nome", text: st.descricao }),
+        el("div", { class: "item-sub", text: st.data ? dataBR(st.data) : "sem data" }),
+      ]),
+      st.tipoSel,
+      el("span", { class: "item-valor", text: $$(st.valor) }),
     ]));
-    if (!cartaoId) {
-      const tipoSel = selectDe([{ valor: "despesa", rotulo: "Saída" }, { valor: "receita", rotulo: "Entrada" }], st.tipo);
-      tipoSel.style.width = "96px";
-      tipoSel.onchange = () => { st.tipo = tipoSel.value; };
-      linha.append(tipoSel);
-    }
-    linha.append(el("span", { class: "item-valor" + (cartaoId || st.tipo === "despesa" ? " down" : " up"), text: $$(st.valor) }));
-    bloco.append(linha);
   }
+
+  const ehCartao = () => destino.value.startsWith("k:");
+  const atualizar = () => {
+    campoFatura.style.display = ehCartao() ? "" : "none";
+    estados.forEach((st) => { st.tipoSel.style.display = ehCartao() ? "none" : ""; });
+  };
+  destino.onchange = atualizar;
 
   const salvar = el("button", { class: "btn largo", type: "button", text: "Salvar provisórios" });
   salvar.onclick = () => {
+    const [esp, id] = destino.value.split(":");
+    const contaId = esp === "c" ? id : null;
+    const cartaoId = esp === "k" ? id : null;
     let ultimo = null;
     for (const st of estados) {
       if (!st.incluir) continue;
-      const data = st.data || dataFallback.value;
       ultimo = inserirProvisorio({
-        tipo: cartaoId ? "despesa_cartao" : st.tipo, valor: st.valor, descricao: st.descricao, data, contaId, cartaoId,
+        tipo: cartaoId ? "despesa_cartao" : st.tipo, valor: st.valor, descricao: st.descricao,
+        data: st.data || dataFallback.value, contaId, cartaoId,
         mesForcado: cartaoId ? Number(fatMes.value) : null,
         anoForcado: cartaoId ? Number(fatAno.value) : null,
       });
@@ -2908,13 +2968,15 @@ function revisarLista(itens, destinoValue) {
     render();
   };
 
-  abrirFolha("Revisar lançamentos", [
-    el("p", { class: "dica", style: "margin-top:0", text:
-      `${estados.length} encontrados. Desmarque os errados${cartaoId ? "" : " e ajuste Saída/Entrada"}. Entram como provisórios.` }),
-    cartaoId ? campoFatura : campo("Data (para itens sem data)", dataFallback),
-    bloco,
-    salvar,
-  ]);
+  const corpo = [
+    el("p", { class: "dica", style: "margin-top:0", text: `${estados.length} encontrados. Confira o destino, desmarque os errados e Salvar.` }),
+    campo("Onde caiu", destino),
+    campoFatura,
+  ];
+  if (faltamData) corpo.push(campoData);
+  corpo.push(bloco, salvar);
+  abrirFolha("Revisar lançamentos", corpo);
+  atualizar();
 }
 
 /** Colar a lista do print (texto extraído pelo celular) e virar vários provisórios. */
@@ -2926,23 +2988,18 @@ function formColarLista() {
   }
   const area = el("textarea", { rows: "8", placeholder: "Cole aqui a lista (uma transação por linha)…",
     style: "width:100%;box-sizing:border-box;resize:vertical;min-height:120px" });
-  const destino = selectDe([
-    ...contas.map((c) => ({ id: `c:${c.id}`, nome: c.nome })),
-    ...cartoes.map((c) => ({ id: `k:${c.id}`, nome: `${c.nome} (cartão)` })),
-  ]);
   const erro = el("p", { class: "erro" });
   const analisar = el("button", { class: "btn largo", type: "button", text: "Analisar" });
   analisar.onclick = () => {
     erro.textContent = "";
     const itens = parseLista(area.value);
     if (!itens.length) return (erro.textContent = "Não achei valores. Deixe uma transação por linha, com o valor (ex.: 71,74).");
-    revisarLista(itens, destino.value);
+    revisarLista(itens);
   };
 
   abrirFolha("Colar lista do dia", [
     el("p", { class: "dica", style: "margin-top:0", text:
-      "No print do banco, use o \"copiar texto da imagem\" do celular (Google Lens / Live Text) e cole aqui. Cada linha vira um provisório." }),
-    campo("Onde caiu", destino),
+      "No print do banco, use o \"copiar texto da imagem\" do celular (Google Lens / Live Text) e cole aqui. O destino (conta ou cartão) você escolhe no próximo passo." }),
     campo("Transações (uma por linha)", area),
     erro,
     analisar,

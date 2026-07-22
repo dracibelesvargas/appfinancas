@@ -12,7 +12,7 @@
  * código, para o app abrir offline.
  */
 
-const VERSAO = "v27";
+const VERSAO = "v29";
 const CACHE = `financas-${VERSAO}`;
 
 const CASCA = [

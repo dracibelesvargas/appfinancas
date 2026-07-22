@@ -108,6 +108,20 @@ export const dataBR = (isoStr) => {
   return `${d}/${m}/${a}`;
 };
 
+/**
+ * "Chave do comerciante": normaliza a descrição para aprender a categoria por LOJA, não por
+ * texto exato. "FACEBK *HU5ATVZ3S2" e "FACEBK*2Y856RMAA2" viram ambos "FACEBK"; "ANGELONI
+ * SUPER LOJA 18" vira "ANGELONI SUPER". É o que faz o app deixar de perguntar de novo.
+ */
+export function chaveMerchant(descricao) {
+  if (!descricao) return "";
+  let s = descricao.normalize("NFKD").replace(/[̀-ͯ]/g, "").toUpperCase();
+  if (s.includes("*")) s = s.split("*")[0]; // o comerciante vem antes do código (FACEBK *...)
+  s = s.replace(/[^A-Z\s]/g, " ").replace(/\s+/g, " ").trim(); // fora dígitos/símbolos
+  const toks = s.split(" ").filter((w) => w.length >= 3);
+  return toks.slice(0, 2).join(" ");
+}
+
 /* ---------------- saldos ---------------- */
 
 const VIVA = "excluido_em IS NULL"; // lixeira não entra em cálculo nenhum (RN-533)
