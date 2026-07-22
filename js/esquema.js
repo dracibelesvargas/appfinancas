@@ -121,6 +121,10 @@ CREATE TABLE IF NOT EXISTS transacoes (
     favorita INTEGER NOT NULL DEFAULT 0,
     /* Ainda não classificada: entra na fila de revisão. */
     revisar INTEGER NOT NULL DEFAULT 0,
+    /* Provisório: lançado à mão a partir de uma notificação, aguardando a fatura/extrato.
+       Já conta no realizado (dá previsibilidade); a importação CONCILIA (confirma) em vez
+       de duplicar. */
+    provisorio INTEGER NOT NULL DEFAULT 0,
     observacao TEXT,
 
     /* Parcelamento: N lançamentos vinculados à compra original (RN-304). */

@@ -42,6 +42,27 @@ function categoriaAprendida(descricao, tipo) {
   return achado?.categoria_id ?? null;
 }
 
+/**
+ * Procura um lançamento PROVISÓRIO (lançado à mão a partir de uma notificação) que case com
+ * um item importado — mesmo lugar (conta ou cartão), tipo e valor, com data próxima (±3
+ * dias, pois a notificação e a data da fatura/extrato podem diferir). Devolve o id ou null.
+ */
+function conciliarProvisorio({ tipo, valor, contaId, cartaoId, data }) {
+  const coluna = cartaoId ? "cartao_id" : "conta_id";
+  const alvo = cartaoId || contaId;
+  if (!alvo) return null;
+  const linha = bd.um(
+    `SELECT id FROM transacoes
+     WHERE excluido_em IS NULL AND provisorio = 1 AND origem = 'manual'
+       AND tipo = ? AND valor = ? AND ${coluna} = ?
+       AND ABS(julianday(data) - julianday(?)) <= 3
+     ORDER BY ABS(julianday(data) - julianday(?))
+     LIMIT 1`,
+    [tipo, valor, alvo, data, data]
+  );
+  return linha?.id ?? null;
+}
+
 /* ---------------- fatura ---------------- */
 
 export async function analisarFatura(arquivo, { senha, mes, ano } = {}) {
@@ -59,6 +80,7 @@ export function gravarFatura(analise, { cartaoId, arquivo }) {
   let duplicados = 0;
   let revisar = 0;
   let provisionados = 0;
+  let conciliados = 0;
 
   bd.transacao(() => {
     const t = bd.agora();
@@ -88,15 +110,27 @@ export function gravarFatura(analise, { cartaoId, arquivo }) {
       const cat = categoriaAprendida(i.descricao, "despesa") ?? semCat;
       const precisaRevisar = cat === semCat ? 1 : 0;
 
-      // Se esta parcela já foi PROVISIONADA por uma fatura anterior, converte a provisão em
-      // real em vez de criar outra — é o que impede a duplicação ao longo dos meses.
-      const convertida = parcelado
+      // Um lançamento PROVISÓRIO da pessoa (notificação) que case: confirma-o em vez de
+      // criar outro. Mantém a categoria que ela já deu; só alinha à fatura.
+      const provManual = conciliarProvisorio({ tipo: "despesa_cartao", valor: i.valor, cartaoId, data: i.data });
+      // Se esta parcela já foi PROVISIONADA por uma fatura anterior, converte a provisão.
+      const convertida = parcelado && !provManual
         ? bd.um(
             "SELECT id FROM transacoes WHERE excluido_em IS NULL AND origem = 'provisionado' AND compra_id = ? AND parcela_num = ?",
             [compraId, i.parcela_num]
           )
         : null;
-      if (convertida) {
+
+      if (provManual) {
+        bd.executar(
+          `UPDATE transacoes SET origem='importado', provisorio=0, situacao='efetivada', arquivo_origem=?,
+                                 impressao=?, data=?, valor=?, mes=?, ano=?, cartao_id=?, compra_id=?,
+                                 parcela_num=?, parcela_total=?, atualizado_em=? WHERE id=?`,
+          [arquivo, digital, i.data, i.valor, i.mes, i.ano, cartaoId, compraId, i.parcela_num, i.parcela_total, t, provManual]
+        );
+        bd.enfileirar("transacoes", provManual, "update");
+        conciliados++;
+      } else if (convertida) {
         bd.executar(
           `UPDATE transacoes SET situacao='efetivada', origem='importado', arquivo_origem=?, impressao=?,
                                  data=?, valor=?, mes=?, ano=?, cartao_id=?, categoria_id=?, revisar=?,
@@ -104,6 +138,8 @@ export function gravarFatura(analise, { cartaoId, arquivo }) {
           [arquivo, digital, i.data, i.valor, i.mes, i.ano, cartaoId, cat, precisaRevisar, i.detalhe, t, convertida.id]
         );
         bd.enfileirar("transacoes", convertida.id, "update");
+        criados++;
+        revisar += precisaRevisar;
       } else {
         const id = bd.uuid();
         bd.executar(
@@ -116,9 +152,9 @@ export function gravarFatura(analise, { cartaoId, arquivo }) {
            precisaRevisar, compraId, i.parcela_num, i.parcela_total, i.detalhe, t, t, disp]
         );
         bd.enfileirar("transacoes", id, "insert");
+        criados++;
+        revisar += precisaRevisar;
       }
-      criados++;
-      revisar += precisaRevisar;
 
       // Provisiona as parcelas futuras ainda inexistentes (pendentes, nos próximos meses).
       if (parcelado) {
@@ -161,7 +197,7 @@ export function gravarFatura(analise, { cartaoId, arquivo }) {
     }
   });
 
-  return { criados, duplicados, revisar, provisionados, pagamentos: analise.pagamentos.length };
+  return { criados, duplicados, revisar, provisionados, conciliados, pagamentos: analise.pagamentos.length };
 }
 
 /* ---------------- extrato ---------------- */
@@ -182,6 +218,7 @@ export function gravarExtrato(analise, { contaId, cartaoId, arquivo }) {
   let criados = 0;
   let duplicados = 0;
   let revisar = 0;
+  let conciliados = 0;
 
   bd.transacao(() => {
     const t = bd.agora();
@@ -233,6 +270,20 @@ export function gravarExtrato(analise, { contaId, cartaoId, arquivo }) {
       // Já classificado pelo histórico não precisa entrar na fila.
       const precisaRevisar = ehTransf ? i.revisar : cat === catSemCategoria(i.tipo) ? 1 : 0;
 
+      // Um lançamento PROVISÓRIO (notificação) que case com uma despesa/receita importada:
+      // confirma-o em vez de duplicar. Transferências não conciliam.
+      const provManual = ehTransf ? null : conciliarProvisorio({ tipo: i.tipo, valor: i.valor, contaId, data: i.data });
+      if (provManual) {
+        bd.executar(
+          `UPDATE transacoes SET origem='importado', provisorio=0, situacao='efetivada', arquivo_origem=?,
+                                 impressao=?, data=?, valor=?, mes=?, ano=?, meio_pagamento=?, atualizado_em=? WHERE id=?`,
+          [arquivo, digital, i.data, i.valor, i.mes, i.ano, i.meio_pagamento, t, provManual]
+        );
+        bd.enfileirar("transacoes", provManual, "update");
+        conciliados++;
+        continue;
+      }
+
       // Transferência precisa saber a direção. O extrato traz o sinal; sem ele, um Pix
       // RECEBIDO entraria como saída e o saldo erra pelo dobro do valor.
       const origem = ehTransf && !i.entrada ? contaId : null;
@@ -261,7 +312,7 @@ export function gravarExtrato(analise, { contaId, cartaoId, arquivo }) {
     }
   });
 
-  return { criados, duplicados, revisar };
+  return { criados, duplicados, revisar, conciliados };
 }
 
 /* ---------------- despacho ---------------- */

@@ -314,6 +314,8 @@ function migrarColunas() {
   garantir("despesas_fixas", "tipo", "tipo TEXT NOT NULL DEFAULT 'despesa'");
   // Tipo investimento: a transação aponta para o investimento do módulo.
   garantir("transacoes", "investimento_id", "investimento_id TEXT REFERENCES investimentos(id)");
+  // Lançamento provisório (notificação antes da importação).
+  garantir("transacoes", "provisorio", "provisorio INTEGER NOT NULL DEFAULT 0");
 
   // Vínculo 1-1 (fixas_mes.transacao_id) -> N×N (baixas): traz o que já foi baixado.
   if (config("migrou_baixas") !== "1" && temColuna("fixas_mes", "transacao_id")) {

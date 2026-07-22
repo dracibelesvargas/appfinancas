@@ -499,6 +499,7 @@ function linhaTransacao(t, aoVoltar = null) {
         `${dataBR(t.data)}${t.categoria_nome ? " · " + t.categoria_nome : ""}` +
         (t.parcela_total ? ` · parcela ${t.parcela_num}/${t.parcela_total}` : "") +
         (credito ? " · reembolso" : "") +
+        (t.provisorio ? " · provisório" : "") +
         (t.revisar ? " · a classificar" : "") +
         (t.situacao === "pendente" ? " · pendente" : "") }),
     ]),
@@ -587,6 +588,14 @@ function formEditarTransacao(t, aoVoltar = null) {
     el("span", { text: "Reembolso / estorno (crédito na fatura)" }),
   ]);
 
+  // Provisório: aguardando conciliação na importação da fatura/extrato.
+  const provisorio = el("input", { type: "checkbox" });
+  provisorio.checked = !!t.provisorio;
+  const campoProvisorio = el("label", { class: "campo", style: "flex-direction:row;align-items:center;gap:10px;cursor:pointer" }, [
+    provisorio,
+    el("span", { text: "Provisório — concilia na importação da fatura/extrato" }),
+  ]);
+
   const erro = el("p", { class: "erro" });
   const campoCategoria = campo("Categoria", categoria);
   const campoConta = campo("Conta", conta);
@@ -610,6 +619,9 @@ function formEditarTransacao(t, aoVoltar = null) {
     campoInvestNovo.style.display = invest && invSel.value === NOVO_INVEST ? "" : "none";
     // Reembolso só existe no cartão que segue como saída.
     campoReembolso.style.display = doCartao && tipoSel.value === "despesa" ? "flex" : "none";
+    // Provisório vale para os tipos que vêm de fatura/extrato (não transferência/investimento).
+    const conciliavel = tipoSel.value === "receita" || tipoSel.value === "despesa";
+    campoProvisorio.style.display = (conciliavel || doCartao) && !transf && !invest ? "flex" : "none";
   };
   tipoSel.onchange = alternar;
   invSel.onchange = alternar;
@@ -662,12 +674,13 @@ function formEditarTransacao(t, aoVoltar = null) {
       catId = categoria.value;
     }
 
+    const prov = (novoTipo === "receita" || novoTipo === "despesa" || novoTipo === "despesa_cartao") && provisorio.checked ? 1 : 0;
     bd.executar(
       `UPDATE transacoes SET tipo=?, valor=?, descricao=?, data=?, mes=?, ano=?,
                              conta_id=?, conta_origem_id=?, conta_destino_id=?, cartao_id=?,
-                             categoria_id=?, investimento_id=?, revisar=0, atualizado_em=? WHERE id=?`,
+                             categoria_id=?, investimento_id=?, provisorio=?, revisar=0, atualizado_em=? WHERE id=?`,
       [novoTipo, v, desc.value.trim() || null, data.value, mes, ano,
-       contaId, origemId, destinoId, cartaoId, catId, investId, bd.agora(), t.id]
+       contaId, origemId, destinoId, cartaoId, catId, investId, prov, bd.agora(), t.id]
     );
     bd.enfileirar("transacoes", t.id, "update");
     // Reclassificar pode mudar a competência (ex.: virar transferência recalcula pela data).
@@ -711,6 +724,7 @@ function formEditarTransacao(t, aoVoltar = null) {
     campoInvest,
     campoInvestNovo,
     campo("Descrição", desc),
+    campoProvisorio,
     erro,
     salvar,
     campoBaixa,
@@ -2582,6 +2596,14 @@ function formTransacao(tipo) {
     { valor: "dinheiro", rotulo: "Dinheiro" },
     { valor: "boleto", rotulo: "Boleto" },
   ]);
+  // Provisório: lançar da notificação e deixar a importação confirmar (só faz sentido nos
+  // tipos que vêm de fatura/extrato).
+  const conciliavel = tipo === "receita" || tipo === "despesa" || tipo === "despesa_cartao";
+  const provisorio = el("input", { type: "checkbox" });
+  const campoProvisorio = el("label", { class: "campo", style: "flex-direction:row;align-items:center;gap:10px;cursor:pointer" }, [
+    provisorio,
+    el("span", { text: "Provisório — concilia na importação da fatura/extrato" }),
+  ]);
   const erro = el("p", { class: "erro" });
 
   const salvar = el("button", { class: "btn largo", type: "button", text: "Salvar" });
@@ -2616,13 +2638,14 @@ function formTransacao(tipo) {
     } else {
       bd.executar(
         `INSERT INTO transacoes (id, tipo, valor, descricao, data, mes, ano, conta_id, cartao_id,
-                                 categoria_id, meio_pagamento, origem, situacao,
+                                 categoria_id, meio_pagamento, provisorio, origem, situacao,
                                  criado_em, atualizado_em, dispositivo)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,'manual','efetivada',?,?,?)`,
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'manual','efetivada',?,?,?)`,
         [id, tipo, v, base.descricao, base.data, mes, ano,
          tipo === "despesa_cartao" ? null : conta.value,
          tipo === "despesa_cartao" ? cartao.value : null,
-         categoria.value, tipo === "despesa_cartao" ? "credito" : meio.value, t, t, bd.idDispositivo()]
+         categoria.value, tipo === "despesa_cartao" ? "credito" : meio.value,
+         conciliavel && provisorio.checked ? 1 : 0, t, t, bd.idDispositivo()]
       );
     }
     bd.enfileirar("transacoes", id, "insert");
@@ -2642,6 +2665,7 @@ function formTransacao(tipo) {
     tipo === "transferencia" ? campo("Para", destino) : null,
     tipo !== "despesa_cartao" ? campo("Meio de pagamento", meio) : null,
     campo("Descrição", desc),
+    conciliavel ? campoProvisorio : null,
     erro,
     salvar,
   ]);
@@ -2957,6 +2981,9 @@ function resultadoImportacao(especie, arquivo, r) {
         (r.duplicados ? `, ${r.duplicados} já existiam.` : ".") }),
       r.revisar
         ? el("p", { class: "dica", text: `${r.revisar} entraram sem categoria e esperam sua classificação.` })
+        : null,
+      r.conciliados
+        ? el("p", { class: "dica", text: `${r.conciliados} confirmaram lançamentos provisórios que você já tinha (sem duplicar).` })
         : null,
       r.provisionados
         ? el("p", { class: "dica", text: `${r.provisionados} parcelas futuras foram provisionadas nos próximos meses.` })
