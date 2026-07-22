@@ -202,6 +202,39 @@ export const saldoNoMes = (mes, ano) =>
     0
   );
 
+/** Um mês futuro já foi "registrado" (importado) se tem algum lançamento efetivado nele. */
+const mesRegistrado = (mes, ano) =>
+  (valor(
+    `SELECT COUNT(*) FROM transacoes WHERE ${VIVA} AND situacao = 'efetivada' AND mes = ? AND ano = ?`,
+    [mes, ano]
+  ) ?? 0) > 0;
+
+/**
+ * Saldo PROJETADO ao fim de uma competência futura: parte do saldo realizado de hoje e
+ * soma, mês a mês, o resultado esperado (previsto) de cada mês seguinte — até que aquele
+ * mês seja registrado (fatura/extrato importado), quando passa a usar o realizado.
+ * Para o mês atual ou passado é o próprio saldo realizado.
+ */
+export function saldoProjetado(mes, ano) {
+  const hoje = competencia(new Date());
+  const ordAlvo = ano * 12 + mes;
+  const ordHoje = hoje.ano * 12 + hoje.mes;
+  if (ordAlvo <= ordHoje) return saldoNoMes(mes, ano);
+
+  let saldo = saldoNoMes(hoje.mes, hoje.ano);
+  let m = hoje.mes;
+  let y = hoje.ano;
+  for (let ord = ordHoje + 1; ord <= ordAlvo; ord++) {
+    m += 1;
+    if (m > 12) { m = 1; y += 1; }
+    const p = previstoDoMes(m, y);
+    saldo += mesRegistrado(m, y)
+      ? p.entradasRealizado - p.saidasRealizado // já importado: realizado do mês
+      : p.entradasPrevisto - p.saidasPrevisto;   // ainda por vir: previsto
+  }
+  return saldo;
+}
+
 /**
  * Reservado nas metas. Metas são ENVELOPES: o dinheiro continua na conta, só está
  * prometido. Por isso não entra em saldoConta — se entrasse, o saldo deixaria de bater
@@ -243,6 +276,38 @@ export const despesasDoMes = (mes, ano) =>
 /** Balanço mensal (glossário): receitas − despesas efetivadas do mês. */
 export const balancoDoMes = (mes, ano) => receitasDoMes(mes, ano) - despesasDoMes(mes, ano);
 
+/** Parcelas provisionadas do mês (compras parceladas ainda pendentes, nos próximos meses). */
+export const provisionadoDoMes = (mes, ano) =>
+  valor(
+    `SELECT COALESCE(SUM(valor), 0) FROM transacoes
+     WHERE ${VIVA} AND tipo = 'despesa_cartao' AND situacao = 'pendente' AND mes = ? AND ano = ?`,
+    [mes, ano]
+  ) ?? 0;
+
+/**
+ * Previsto × Realizado do mês (comparação, não soma).
+ *   Previsto  = o planejado: entradas/despesas fixas (valor do mês) + parcelas provisionadas.
+ *   Realizado = o que de fato aconteceu (efetivado).
+ * Assim dá para ver quanto do plano já foi cumprido e se estourou.
+ */
+export function previstoDoMes(mes, ano) {
+  const rec = fixasDoMes(mes, ano, "receita").filter((f) => f.status !== "pulado");
+  const dep = fixasDoMes(mes, ano, "despesa").filter((f) => f.status !== "pulado");
+  const entradasPrevisto = rec.reduce((s, f) => s + f.valor, 0);
+  const saidasFixasPrevisto = dep.reduce((s, f) => s + f.valor, 0);
+  const provisionadas = provisionadoDoMes(mes, ano);
+  return {
+    entradasPrevisto,
+    entradasRealizado: receitasDoMes(mes, ano),
+    saidasFixasPrevisto,
+    provisionadas,
+    saidasPrevisto: saidasFixasPrevisto + provisionadas,
+    saidasRealizado: despesasDoMes(mes, ano),
+    resultadoPrevisto: entradasPrevisto - (saidasFixasPrevisto + provisionadas),
+    resultadoRealizado: receitasDoMes(mes, ano) - despesasDoMes(mes, ano),
+  };
+}
+
 /* ---------------- histórico manual dos meses anteriores ---------------- */
 
 /** Totais informados à mão para um mês (ou null). */
@@ -262,7 +327,18 @@ export function despesasExibicao(mes, ano) {
 }
 export function saldoExibicao(mes, ano) {
   const h = historicoDoMes(mes, ano);
-  return h && h.saldo != null ? h.saldo : saldoNoMes(mes, ano);
+  if (h && h.saldo != null) return h.saldo; // mês de referência (histórico manual)
+  const hoje = competencia(new Date());
+  // Mês futuro ainda não registrado: mostra o projetado pelo previsto.
+  if (ano * 12 + mes > hoje.ano * 12 + hoje.mes) return saldoProjetado(mes, ano);
+  return saldoNoMes(mes, ano);
+}
+
+/** É um mês futuro cujo saldo está sendo projetado (previsto), não realizado? */
+export function mesEhProjetado(mes, ano) {
+  if (historicoDoMes(mes, ano)) return false;
+  const hoje = competencia(new Date());
+  return ano * 12 + mes > hoje.ano * 12 + hoje.mes && !mesRegistrado(mes, ano);
 }
 
 /* ---------------- cartão ---------------- */

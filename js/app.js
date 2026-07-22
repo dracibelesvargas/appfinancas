@@ -6,9 +6,9 @@ import * as hist from "./migrar-historico.js";
 import * as nuvem from "./nuvem.js";
 import {
   MESES, MESES_LONGO, aplicadoInvestimento, brl, competencia, dataBR, dataVencimento, despesasDoMes,
-  despesasExibicao, faturaDoMes, fixasDoMes, historicoDoMes, iso, limiteDisponivel, paraCentavos,
-  receitasDoMes, receitasExibicao, saldoConta, saldoContaNoMes, saldoDisponivel, saldoExibicao,
-  saldoNoMes, saldoTotal, totalFixas, totalInvestido, totalReservado,
+  despesasExibicao, faturaDoMes, fixasDoMes, historicoDoMes, iso, limiteDisponivel, mesEhProjetado,
+  paraCentavos, previstoDoMes, receitasDoMes, receitasExibicao, saldoConta, saldoContaNoMes,
+  saldoDisponivel, saldoExibicao, saldoNoMes, saldoTotal, totalFixas, totalInvestido, totalReservado,
 } from "./dominio.js";
 
 const hoje = new Date();
@@ -46,8 +46,9 @@ async function enviarNuvem() {
 function pintarNuvem() {
   const b = $("#btn-nuvem");
   if (!b) return;
-  if (!nuvem.estaConfigurado()) { b.hidden = true; return; }
-  b.hidden = false;
+  // style.display vence o [hidden] (que o CSS do .icone-topo sobrepõe).
+  if (!nuvem.estaConfigurado()) { b.style.display = "none"; return; }
+  b.style.display = "";
   const temUltimo = !!nuvem.info().ultimo;
   const mapa = {
     pendente: ["#e0a23b", "Backup pendente…"],
@@ -136,12 +137,14 @@ function telaPrincipal(c) {
   const despesas = despesasExibicao(estado.mes, estado.ano);
   const reservado = totalReservado();
   const ehHistorico = !!historicoDoMes(estado.mes, estado.ano);
+  const ehProjetado = mesEhProjetado(estado.mes, estado.ano);
 
   // Resumo
   const saldoMes = saldoExibicao(estado.mes, estado.ano);
   const resumo = el("section", { class: "resumo" });
   resumo.append(
-    el("div", { class: "resumo-rotulo", text: `Saldo em ${MESES_LONGO[estado.mes - 1]}` + (ehHistorico ? " · referência" : "") }),
+    el("div", { class: "resumo-rotulo", text:
+      `Saldo em ${MESES_LONGO[estado.mes - 1]}` + (ehHistorico ? " · referência" : ehProjetado ? " · previsto" : "") }),
     el("div", { class: "resumo-saldo", text: $$(saldoMes) })
   );
   if (reservado > 0) {
@@ -191,6 +194,11 @@ function telaPrincipal(c) {
     dois.append(fluxo);
   }
   resumo.append(dois);
+  // Previsto × Realizado no MESMO painel, logo abaixo de Entradas/Saídas.
+  if (!ehHistorico) {
+    const bp = blocoPrevisto();
+    if (bp) resumo.append(bp);
+  }
   c.append(resumo);
 
   // Alertas
@@ -211,6 +219,32 @@ function telaPrincipal(c) {
   }
 
   c.append(secaoContas(), secaoCartoes(), secaoMetas(), secaoInvestimentos());
+}
+
+/** Bloco Previsto × Realizado (fixas + parcelas provisionadas vs efetivado), para embutir
+ *  no painel do topo. Retorna null quando não há plano a comparar. */
+function blocoPrevisto() {
+  const p = previstoDoMes(estado.mes, estado.ano);
+  if (p.entradasPrevisto + p.saidasPrevisto === 0) return null;
+
+  const bloco = el("div", { class: "previsto" }, el("div", { class: "previsto-titulo", text: "Previsto × Realizado" }));
+
+  const pctE = p.entradasPrevisto ? (p.entradasRealizado / p.entradasPrevisto) * 100 : 0;
+  bloco.append(barraProporcao(
+    "Entradas",
+    `${$$(p.entradasRealizado)} de ${$$(p.entradasPrevisto)}`,
+    pctE, "var(--receita)", 7,
+    () => abrirLista("Entradas do mês", "t.tipo='receita' AND t.mes=? AND t.ano=?", [estado.mes, estado.ano])
+  ));
+
+  const pctS = p.saidasPrevisto ? (p.saidasRealizado / p.saidasPrevisto) * 100 : 0;
+  bloco.append(barraProporcao(
+    "Saídas",
+    `${$$(p.saidasRealizado)} de ${$$(p.saidasPrevisto)}` + (p.provisionadas ? ` · ${$$(p.provisionadas)} em parcelas` : ""),
+    pctS, "var(--despesa)", 7,
+    () => abrirLista("Saídas do mês", "t.tipo IN ('despesa','despesa_cartao') AND t.mes=? AND t.ano=?", [estado.mes, estado.ano])
+  ));
+  return bloco;
 }
 
 function secaoInvestimentos() {
@@ -270,7 +304,8 @@ function secaoContas() {
     bloco.append(
       el("div", { class: "total-linha" }, [
         el("span", { text: "Total" }),
-        el("span", { text: $$(saldoExibicao(estado.mes, estado.ano)) }),
+        // Soma dos cards (realizado por conta) — a projeção fica no saldo do topo.
+        el("span", { text: $$(saldoNoMes(estado.mes, estado.ano)) }),
       ])
     );
   }
